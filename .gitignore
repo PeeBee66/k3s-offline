@@ -1,0 +1,7 @@
+# Large binary files - too big for GitHub (>100MB)
+# Download these manually using URLs in K3S-OFFLINE-GUIDE.md
+k3s/1.33/k3s
+k3s/1.33/k3s-airgap-images-amd64.tar.zst
+k3s/1.35/k3s
+k3s/1.35/k3s-airgap-images-amd64.tar.zst
+helm/helm-v3.20.0-linux-amd64.tar.gz
