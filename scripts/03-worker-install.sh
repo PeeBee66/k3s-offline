@@ -3,26 +3,28 @@ set -euo pipefail
 
 ###############################################################################
 # 03-worker-install.sh
-# Installs k3s agent (worker) and joins it to the controller cluster.
-# Run on 192.168.66.199
+# Installs k3s agent (worker) and joins it to the cluster.
 #
-# Usage: sudo ./03-worker-install.sh <NODE_TOKEN>
-#   or:  sudo K3S_TOKEN=<token> ./03-worker-install.sh
+# Variables:
+#   DATA_SERVER  — IP of the file server + registry host (default: 192.168.66.198)
+#   K3S_VERSION  — Version folder: 1.33 or 1.35 (default: 1.33)
+#   K3S_TOKEN    — Node token from primary controller (required)
+#   CONTROLLER_IP — IP of a controller node to join (default: DATA_SERVER)
+#
+# The node IP is auto-detected from the default route interface.
+#
+# Usage:
+#   sudo K3S_TOKEN=<token> DATA_SERVER=192.168.66.198 ./03-worker-install.sh
+#   sudo K3S_TOKEN=<token> CONTROLLER_IP=10.0.0.1 DATA_SERVER=10.0.0.1 ./03-worker-install.sh
 ###############################################################################
 
 K3S_VERSION="${K3S_VERSION:-1.33}"
-CONTROLLER_IP="${CONTROLLER_IP:-192.168.66.198}"
-FILESERVER="${FILESERVER:-http://192.168.66.198:8080}"
-REGISTRY="${REGISTRY:-192.168.66.198:5000}"
+DATA_SERVER="${DATA_SERVER:-192.168.66.198}"
+CONTROLLER_IP="${CONTROLLER_IP:-${DATA_SERVER}}"
+K3S_TOKEN="${K3S_TOKEN:-${1:-}}"
 
-# Token from arg or env
-if [[ -n "${1:-}" ]]; then
-    K3S_TOKEN="$1"
-elif [[ -z "${K3S_TOKEN:-}" ]]; then
-    echo "Usage: $0 <NODE_TOKEN>"
-    echo "  or:  K3S_TOKEN=<token> $0"
-    exit 1
-fi
+FILESERVER="http://${DATA_SERVER}:8080"
+REGISTRY="${DATA_SERVER}:5000"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -34,6 +36,23 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 [[ $(id -u) -eq 0 ]] || err "Must run as root (use sudo)"
+[[ -n "$K3S_TOKEN" ]] || err "K3S_TOKEN is required. Pass as env var or first argument."
+
+# Auto-detect node IP
+NODE_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || hostname -I | awk '{print $1}')
+[[ -n "$NODE_IP" ]] || err "Could not detect node IP"
+
+log "========================================="
+log "  k3s Worker Install"
+log "========================================="
+log "  Node IP:       ${NODE_IP}"
+log "  Controller IP: ${CONTROLLER_IP}"
+log "  Data Server:   ${DATA_SERVER}"
+log "  File Server:   ${FILESERVER}"
+log "  Registry:      ${REGISTRY}"
+log "  k3s Version:   ${K3S_VERSION}"
+log "========================================="
+echo ""
 
 WORK_DIR=$(mktemp -d)
 trap "rm -rf $WORK_DIR" EXIT
@@ -41,44 +60,36 @@ trap "rm -rf $WORK_DIR" EXIT
 ###############################################################################
 # Step 1: Download artefacts
 ###############################################################################
-log "=== Step 1: Downloading artefacts (k3s ${K3S_VERSION}) ==="
-
-log "Downloading k3s binary..."
+log "=== Step 1: Downloading artefacts ==="
 curl -fSL -o "$WORK_DIR/k3s" "${FILESERVER}/k3s/${K3S_VERSION}/k3s"
-
-log "Downloading airgap images..."
 curl -fSL -o "$WORK_DIR/k3s-airgap-images-amd64.tar.zst" \
     "${FILESERVER}/k3s/${K3S_VERSION}/k3s-airgap-images-amd64.tar.zst"
-
-log "Downloading install script..."
 curl -fSL -o "$WORK_DIR/install.sh" "${FILESERVER}/k3s/${K3S_VERSION}/install.sh"
-
-log "Downloading checksums..."
 curl -fSL -o "$WORK_DIR/sha256sum-amd64.txt" \
     "${FILESERVER}/k3s/${K3S_VERSION}/sha256sum-amd64.txt"
 
 ###############################################################################
 # Step 2: Verify checksum
 ###############################################################################
-log "=== Step 2: Verifying k3s binary checksum ==="
+log "=== Step 2: Verifying checksum ==="
 cd "$WORK_DIR"
 expected=$(grep "  k3s$" sha256sum-amd64.txt | awk '{print $1}')
 actual=$(sha256sum k3s | awk '{print $1}')
 if [[ "$expected" == "$actual" ]]; then
-    log "Checksum verified: PASS"
+    log "Checksum: PASS"
 else
-    err "Checksum MISMATCH! Expected: $expected Got: $actual"
+    err "Checksum MISMATCH!"
 fi
 
 ###############################################################################
-# Step 3: Install k3s-selinux
+# Step 3: SELinux
 ###############################################################################
-log "=== Step 3: Installing k3s-selinux ==="
+log "=== Step 3: SELinux ==="
 if command -v getenforce &>/dev/null && [[ "$(getenforce)" != "Disabled" ]]; then
     if ! rpm -q k3s-selinux &>/dev/null; then
         dnf install -y container-selinux selinux-policy-base policycoreutils 2>/dev/null || true
         curl -fSL -o "$WORK_DIR/k3s-selinux.rpm" "${FILESERVER}/rpm/k3s-selinux-1.6-1.el9.noarch.rpm"
-        rpm -ivh --nodeps "$WORK_DIR/k3s-selinux.rpm" || warn "k3s-selinux install had warnings"
+        rpm -ivh --nodeps "$WORK_DIR/k3s-selinux.rpm" || warn "k3s-selinux warnings"
     else
         log "k3s-selinux already installed"
     fi
@@ -87,22 +98,17 @@ else
 fi
 
 ###############################################################################
-# Step 4: Place binary
+# Step 4: Place binary + images
 ###############################################################################
-log "=== Step 4: Installing k3s binary ==="
+log "=== Step 4: Installing binary + images ==="
 install -m 755 "$WORK_DIR/k3s" /usr/local/bin/k3s
-
-###############################################################################
-# Step 5: Place airgap images
-###############################################################################
-log "=== Step 5: Staging airgap images ==="
 mkdir -p /var/lib/rancher/k3s/agent/images/
 cp "$WORK_DIR/k3s-airgap-images-amd64.tar.zst" /var/lib/rancher/k3s/agent/images/
 
 ###############################################################################
-# Step 6: Configure registry mirror
+# Step 5: Registry mirror
 ###############################################################################
-log "=== Step 6: Configuring registry mirror ==="
+log "=== Step 5: Registry mirror ==="
 mkdir -p /etc/rancher/k3s
 cat > /etc/rancher/k3s/registries.yaml <<EOF
 mirrors:
@@ -122,34 +128,34 @@ configs:
 EOF
 
 ###############################################################################
-# Step 6b: Open firewall ports
+# Step 6: Firewall
 ###############################################################################
-log "=== Step 6b: Configuring firewall ==="
+log "=== Step 6: Firewall ==="
 if command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port=8472/udp   # Flannel VXLAN
-    firewall-cmd --permanent --add-port=10250/tcp  # kubelet metrics
-    firewall-cmd --permanent --add-port=51820/udp  # WireGuard
-    firewall-cmd --permanent --add-port=51821/udp  # WireGuard v6
+    for port in 8472/udp 10250/tcp 51820/udp 51821/udp; do
+        firewall-cmd --permanent --add-port="$port" 2>/dev/null || true
+    done
     firewall-cmd --reload
-    log "Firewall configured"
+    log "Firewall ports opened"
 else
-    log "No firewalld detected, skipping"
+    log "No firewalld, skipping"
 fi
 
 ###############################################################################
-# Step 7: Run k3s install (agent mode)
+# Step 7: Install k3s agent
 ###############################################################################
-log "=== Step 7: Running k3s install (agent mode) ==="
+log "=== Step 7: Installing k3s agent ==="
 chmod +x "$WORK_DIR/install.sh"
 
 INSTALL_K3S_SKIP_DOWNLOAD=true \
 INSTALL_K3S_SKIP_SELINUX_RPM=true \
 K3S_URL="https://${CONTROLLER_IP}:6443" \
 K3S_TOKEN="${K3S_TOKEN}" \
+INSTALL_K3S_EXEC="agent --node-ip=${NODE_IP}" \
 "$WORK_DIR/install.sh"
 
 ###############################################################################
-# Step 8: Wait for agent to register
+# Step 8: Wait for agent
 ###############################################################################
 log "=== Step 8: Waiting for agent service ==="
 TIMEOUT=60
@@ -157,14 +163,14 @@ ELAPSED=0
 while ! systemctl is-active --quiet k3s-agent; do
     sleep 5
     ELAPSED=$((ELAPSED + 5))
-    if [[ $ELAPSED -ge $TIMEOUT ]]; then
-        err "k3s-agent did not start within ${TIMEOUT}s"
-    fi
+    [[ $ELAPSED -ge $TIMEOUT ]] && err "k3s-agent did not start within ${TIMEOUT}s"
     log "Waiting... (${ELAPSED}s)"
 done
 
-log "=== Installation complete ==="
+log "========================================="
+log "  Worker Install Complete"
+log "========================================="
 echo ""
-log "k3s-agent is running"
+log "Node IP: ${NODE_IP}"
+log "Joined:  https://${CONTROLLER_IP}:6443"
 log "Verify from controller: k3s kubectl get nodes"
-log "This node should appear as Ready within ~30s"

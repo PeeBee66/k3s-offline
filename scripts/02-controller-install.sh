@@ -3,14 +3,35 @@ set -euo pipefail
 
 ###############################################################################
 # 02-controller-install.sh
-# Installs k3s server (controller) on 192.168.66.198 using offline artefacts.
-# Artefacts served from http://192.168.66.198:8080
+# Installs k3s server (controller) node.
+#
+# Supports:
+#   MODE=pri  — Primary controller (initialises new cluster with --cluster-init)
+#   MODE=sec  — Secondary controller (joins existing cluster as control-plane)
+#
+# Variables:
+#   DATA_SERVER  — IP of the file server + registry host (default: 192.168.66.198)
+#   K3S_VERSION  — Version folder to use: 1.33 or 1.35 (default: 1.33)
+#   MODE         — pri or sec (default: pri)
+#   K3S_TOKEN    — Required for sec mode (from primary controller)
+#   PRI_IP       — Required for sec mode (primary controller IP)
+#
+# The node IP is auto-detected from the default route interface.
+# The registry is at DATA_SERVER:5000, file server at DATA_SERVER:8080.
+#
+# Usage:
+#   sudo MODE=pri DATA_SERVER=192.168.66.198 ./02-controller-install.sh
+#   sudo MODE=sec PRI_IP=192.168.66.198 K3S_TOKEN=<token> ./02-controller-install.sh
 ###############################################################################
 
 K3S_VERSION="${K3S_VERSION:-1.33}"
-FILESERVER="http://192.168.66.198:8080"
-REGISTRY="192.168.66.198:5000"
-NODE_IP="192.168.66.198"
+DATA_SERVER="${DATA_SERVER:-192.168.66.198}"
+MODE="${MODE:-pri}"
+PRI_IP="${PRI_IP:-}"
+K3S_TOKEN="${K3S_TOKEN:-}"
+
+FILESERVER="http://${DATA_SERVER}:8080"
+REGISTRY="${DATA_SERVER}:5000"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -21,52 +42,74 @@ log()  { echo -e "${GREEN}[INSTALL]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
-# Must run as root
 [[ $(id -u) -eq 0 ]] || err "Must run as root (use sudo)"
+
+# Validate mode
+MODE=$(echo "$MODE" | tr '[:upper:]' '[:lower:]')
+case "$MODE" in
+    pri|primary) MODE="pri" ;;
+    sec|secondary) MODE="sec" ;;
+    *) err "Invalid MODE: $MODE (must be pri or sec)" ;;
+esac
+
+# Secondary mode requires token and primary IP
+if [[ "$MODE" == "sec" ]]; then
+    [[ -n "$K3S_TOKEN" ]] || err "MODE=sec requires K3S_TOKEN"
+    [[ -n "$PRI_IP" ]] || err "MODE=sec requires PRI_IP (primary controller IP)"
+fi
+
+# Auto-detect node IP from default route
+NODE_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || hostname -I | awk '{print $1}')
+[[ -n "$NODE_IP" ]] || err "Could not detect node IP"
+
+log "========================================="
+log "  k3s Controller Install"
+log "========================================="
+log "  Mode:        ${MODE}"
+log "  Node IP:     ${NODE_IP}"
+log "  Data Server: ${DATA_SERVER}"
+log "  File Server: ${FILESERVER}"
+log "  Registry:    ${REGISTRY}"
+log "  k3s Version: ${K3S_VERSION}"
+[[ "$MODE" == "sec" ]] && log "  Primary IP:  ${PRI_IP}"
+log "========================================="
+echo ""
 
 WORK_DIR=$(mktemp -d)
 trap "rm -rf $WORK_DIR" EXIT
 
 ###############################################################################
-# Step 1: Download artefacts from nginx file server
+# Step 1: Download artefacts from file server
 ###############################################################################
-log "=== Step 1: Downloading artefacts (k3s ${K3S_VERSION}) ==="
+log "=== Step 1: Downloading artefacts ==="
 
-log "Downloading k3s binary..."
 curl -fSL -o "$WORK_DIR/k3s" "${FILESERVER}/k3s/${K3S_VERSION}/k3s"
-
-log "Downloading airgap images..."
 curl -fSL -o "$WORK_DIR/k3s-airgap-images-amd64.tar.zst" \
     "${FILESERVER}/k3s/${K3S_VERSION}/k3s-airgap-images-amd64.tar.zst"
-
-log "Downloading install script..."
 curl -fSL -o "$WORK_DIR/install.sh" "${FILESERVER}/k3s/${K3S_VERSION}/install.sh"
-
-log "Downloading checksums..."
 curl -fSL -o "$WORK_DIR/sha256sum-amd64.txt" \
     "${FILESERVER}/k3s/${K3S_VERSION}/sha256sum-amd64.txt"
+log "Downloads complete"
 
 ###############################################################################
-# Step 2: Verify checksum of k3s binary
+# Step 2: Verify checksum
 ###############################################################################
-log "=== Step 2: Verifying k3s binary checksum ==="
+log "=== Step 2: Verifying checksum ==="
 cd "$WORK_DIR"
 expected=$(grep "  k3s$" sha256sum-amd64.txt | awk '{print $1}')
 actual=$(sha256sum k3s | awk '{print $1}')
 if [[ "$expected" == "$actual" ]]; then
-    log "Checksum verified: PASS"
+    log "Checksum: PASS"
 else
     err "Checksum MISMATCH! Expected: $expected Got: $actual"
 fi
 
 ###############################################################################
-# Step 3: Install k3s-selinux RPM (if SELinux enabled)
+# Step 3: Install k3s-selinux
 ###############################################################################
-log "=== Step 3: Installing k3s-selinux ==="
+log "=== Step 3: SELinux ==="
 if command -v getenforce &>/dev/null && [[ "$(getenforce)" != "Disabled" ]]; then
-    log "SELinux is active, installing k3s-selinux RPM..."
     if ! rpm -q k3s-selinux &>/dev/null; then
-        # Install dependencies
         dnf install -y container-selinux selinux-policy-base policycoreutils 2>/dev/null || true
         curl -fSL -o "$WORK_DIR/k3s-selinux.rpm" "${FILESERVER}/rpm/k3s-selinux-1.6-1.el9.noarch.rpm"
         rpm -ivh --nodeps "$WORK_DIR/k3s-selinux.rpm" || warn "k3s-selinux install had warnings"
@@ -74,28 +117,21 @@ if command -v getenforce &>/dev/null && [[ "$(getenforce)" != "Disabled" ]]; the
         log "k3s-selinux already installed"
     fi
 else
-    log "SELinux disabled or not present, skipping"
+    log "SELinux disabled, skipping"
 fi
 
 ###############################################################################
-# Step 4: Place k3s binary
+# Step 4: Place binary and images
 ###############################################################################
-log "=== Step 4: Installing k3s binary ==="
+log "=== Step 4: Installing binary + images ==="
 install -m 755 "$WORK_DIR/k3s" /usr/local/bin/k3s
-log "k3s binary installed at /usr/local/bin/k3s"
-
-###############################################################################
-# Step 5: Place airgap images
-###############################################################################
-log "=== Step 5: Staging airgap images ==="
 mkdir -p /var/lib/rancher/k3s/agent/images/
 cp "$WORK_DIR/k3s-airgap-images-amd64.tar.zst" /var/lib/rancher/k3s/agent/images/
-log "Airgap images staged"
 
 ###############################################################################
-# Step 6: Configure private registry mirror
+# Step 5: Configure registry mirror
 ###############################################################################
-log "=== Step 6: Configuring registry mirror ==="
+log "=== Step 5: Registry mirror ==="
 mkdir -p /etc/rancher/k3s
 cat > /etc/rancher/k3s/registries.yaml <<EOF
 mirrors:
@@ -113,50 +149,57 @@ configs:
     tls:
       insecure_skip_verify: true
 EOF
-log "Registry mirror configured at /etc/rancher/k3s/registries.yaml"
 
 ###############################################################################
-# Step 6b: Open firewall ports
+# Step 6: Firewall
 ###############################################################################
-log "=== Step 6b: Configuring firewall ==="
+log "=== Step 6: Firewall ==="
 if command -v firewall-cmd &>/dev/null && firewall-cmd --state &>/dev/null 2>&1; then
-    firewall-cmd --permanent --add-port=6443/tcp   # k3s API
-    firewall-cmd --permanent --add-port=8472/udp   # Flannel VXLAN
-    firewall-cmd --permanent --add-port=10250/tcp  # kubelet metrics
-    firewall-cmd --permanent --add-port=51820/udp  # WireGuard
-    firewall-cmd --permanent --add-port=51821/udp  # WireGuard v6
-    firewall-cmd --permanent --add-port=5000/tcp   # Registry
-    firewall-cmd --permanent --add-port=8080/tcp   # Nginx
-    firewall-cmd --permanent --add-port=8888/tcp   # Gitea
-    firewall-cmd --permanent --add-port=9090/tcp   # Portainer
-    firewall-cmd --permanent --add-port=9999/tcp   # Dozzle
-    firewall-cmd --permanent --add-port=2222/tcp   # Gitea SSH
+    for port in 6443/tcp 8472/udp 10250/tcp 51820/udp 51821/udp 2379/tcp 2380/tcp; do
+        firewall-cmd --permanent --add-port="$port" 2>/dev/null || true
+    done
     firewall-cmd --reload
-    log "Firewall configured"
+    log "Firewall ports opened"
 else
-    log "No firewalld detected, skipping"
+    log "No firewalld, skipping"
 fi
 
 ###############################################################################
-# Step 7: Run k3s install script
+# Step 7: Install k3s
 ###############################################################################
-log "=== Step 7: Running k3s install (server mode) ==="
+log "=== Step 7: Installing k3s (${MODE} controller) ==="
 chmod +x "$WORK_DIR/install.sh"
 
-INSTALL_K3S_SKIP_DOWNLOAD=true \
-INSTALL_K3S_SKIP_SELINUX_RPM=true \
-INSTALL_K3S_EXEC="server \
-  --node-ip=${NODE_IP} \
-  --disable=cloud-controller-manager \
-  --write-kubeconfig-mode=644 \
-  --tls-san=${NODE_IP}" \
-"$WORK_DIR/install.sh"
+if [[ "$MODE" == "pri" ]]; then
+    # Primary controller — initialise cluster with embedded etcd
+    INSTALL_K3S_SKIP_DOWNLOAD=true \
+    INSTALL_K3S_SKIP_SELINUX_RPM=true \
+    INSTALL_K3S_EXEC="server \
+      --cluster-init \
+      --node-ip=${NODE_IP} \
+      --disable=cloud-controller-manager \
+      --write-kubeconfig-mode=644 \
+      --tls-san=${NODE_IP}" \
+    "$WORK_DIR/install.sh"
+else
+    # Secondary controller — join existing cluster
+    INSTALL_K3S_SKIP_DOWNLOAD=true \
+    INSTALL_K3S_SKIP_SELINUX_RPM=true \
+    K3S_TOKEN="${K3S_TOKEN}" \
+    INSTALL_K3S_EXEC="server \
+      --server=https://${PRI_IP}:6443 \
+      --node-ip=${NODE_IP} \
+      --disable=cloud-controller-manager \
+      --write-kubeconfig-mode=644 \
+      --tls-san=${NODE_IP}" \
+    "$WORK_DIR/install.sh"
+fi
 
 ###############################################################################
-# Step 8: Wait for k3s to be ready
+# Step 8: Wait for ready
 ###############################################################################
-log "=== Step 8: Waiting for k3s to be ready ==="
-TIMEOUT=120
+log "=== Step 8: Waiting for node Ready ==="
+TIMEOUT=300
 ELAPSED=0
 while ! k3s kubectl get nodes &>/dev/null; do
     sleep 5
@@ -164,21 +207,36 @@ while ! k3s kubectl get nodes &>/dev/null; do
     if [[ $ELAPSED -ge $TIMEOUT ]]; then
         err "k3s did not become ready within ${TIMEOUT}s"
     fi
-    log "Waiting for k3s... (${ELAPSED}s)"
+    log "Waiting... (${ELAPSED}s)"
+done
+
+# Wait for this specific node
+while true; do
+    status=$(k3s kubectl get node "$(hostname | tr '[:upper:]' '[:lower:]')" --no-headers 2>/dev/null | awk '{print $2}' || echo "NotReady")
+    [[ "$status" == "Ready" ]] && break
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    [[ $ELAPSED -ge $TIMEOUT ]] && err "Node not Ready within ${TIMEOUT}s"
+    log "Waiting for Ready... (${ELAPSED}s) — status: $status"
 done
 
 ###############################################################################
-# Step 9: Output results
+# Step 9: Output
 ###############################################################################
-log "=== Step 9: Installation complete ==="
+log "========================================="
+log "  Installation Complete (${MODE})"
+log "========================================="
 echo ""
 log "Node status:"
 k3s kubectl get nodes -o wide
 echo ""
-log "Node token (save this for worker join):"
-cat /var/lib/rancher/k3s/server/node-token
-echo ""
+
+if [[ "$MODE" == "pri" ]]; then
+    log "Node token (use for sec controllers and workers):"
+    cat /var/lib/rancher/k3s/server/node-token
+    echo ""
+fi
+
 log "Kubeconfig: /etc/rancher/k3s/k3s.yaml"
-log "To use kubectl: export KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
+log "Node IP:    ${NODE_IP}"
 echo ""
-log "Next step: Run 03-worker-install.sh on the worker node with the token above"
